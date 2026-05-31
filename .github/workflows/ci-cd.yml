@@ -119,3 +119,61 @@ jobs:
         with:
           name: staging-metrics
           path: staging_metrics.txt
+  deploy-production:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Convert repository name to lowercase
+        run: |
+          echo "REPO_LOWER=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Blue-green deploy to production
+        run: |
+          VERSION=${{ github.event.inputs.version }}
+          if [ -z "$VERSION" ]; then VERSION="latest"; fi
+          IMAGE=ghcr.io/${{ env.REPO_LOWER }}:$VERSION
+
+          # Шаг 1: Запускаем новую версию (green) на изолированном порту 8081
+          docker run -d --name app-green -p 8081:8080 $IMAGE
+          sleep 5
+          
+          # Проверяем её работоспособность (Health Check)
+          curl --retry 5 --retry-delay 2 --fail http://localhost:8081/health || exit 1
+
+          # Шаг 2: Переключаем трафик — гасим старый боевой blue контейнер (если он был)
+          docker stop app-blue 2>/dev/null || true
+          docker rm app-blue 2>/dev/null || true
+
+          # Запускаем проверенную версию на основном продакшн порту 8080 (теперь она становится blue)
+          docker run -d --name app-blue -p 8080:8080 $IMAGE
+          sleep 3
+          curl --fail http://localhost:8080/health || exit 1
+
+          # Шаг 3: Зачищаем временный грин-контейнер
+          docker stop app-green && docker rm app-green
+
+          # Сохраняем информацию о текущей версии
+          echo $VERSION > current_version.txt
+
+      - name: Save production logs
+        if: always()
+        run: docker logs app-blue > production_logs.txt
+
+      - name: Upload production logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-logs
+          path: production_logs.txt
+
+      - name: Save production metrics
+        run: |
+          curl -s http://localhost:8080/metrics > production_metrics.txt
+
+      - name: Upload production metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-metrics
+          path: production_metrics.txt
